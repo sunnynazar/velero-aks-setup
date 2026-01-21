@@ -1,0 +1,66 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: velero
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  
+  source:
+    # Velero Helm chart from official repository
+    chart: velero
+    repoURL: https://vmware-tanzu.github.io/helm-charts
+    targetRevision: 6.7.0  # Update to latest stable version
+    
+    helm:
+      # Reference to values file in this repository
+      valueFiles:
+        - values.yaml
+      
+      # Or alternatively, inline values from Git repository
+      # valuesObject:
+      #   See velero/values.yaml for configuration
+      
+      parameters:
+        # You can override specific values here
+        - name: configuration.backupStorageLocation[0].bucket
+          value: velero-backups
+        - name: credentials.existingSecret
+          value: velero-credentials
+  
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: velero
+  
+  syncPolicy:
+    automated:
+      # Automatically sync when changes are detected
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    
+    syncOptions:
+      # Create namespace if it doesn't exist
+      - CreateNamespace=true
+      # Preserve resource versions
+      - PreserveResourcesOnDeletion=false
+      # Replace resources instead of applying
+      - Replace=false
+      # Server-side apply
+      - ServerSideApply=true
+    
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+  
+  # Health assessment
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas
