@@ -2,79 +2,71 @@
 
 ###############################################################################
 # Velero Azure Setup Script
-# This script sets up all Azure resources required for Velero backups
+# Sets up Azure resources for Velero using Workload Identity (no storage keys)
 ###############################################################################
 
 set -e
 
-# Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Function to print colored output
-print_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
-}
+print_info()    { echo -e "${GREEN}[INFO]${NC} $1"; }
+print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
+print_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
 
-print_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
-}
+command_exists() { command -v "$1" >/dev/null 2>&1; }
 
-print_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
-
-# Function to check if command exists
-command_exists() {
-    command -v "$1" >/dev/null 2>&1
-}
-
-# Check prerequisites
+# ---------------------------------------------------------------------------
+# Prerequisites
+# ---------------------------------------------------------------------------
 print_info "Checking prerequisites..."
 
-if ! command_exists az; then
-    print_error "Azure CLI (az) is not installed. Please install it first."
-    exit 1
-fi
-
-if ! command_exists kubectl; then
-    print_error "kubectl is not installed. Please install it first."
-    exit 1
-fi
+for cmd in az kubectl; do
+    if ! command_exists "$cmd"; then
+        print_error "'$cmd' is not installed. Please install it first."
+        exit 1
+    fi
+done
 
 print_info "Prerequisites check passed!"
 
-# Load configuration or prompt for values
+# ---------------------------------------------------------------------------
+# Load configuration
+# ---------------------------------------------------------------------------
 if [ -f "../config/config.env" ]; then
     print_info "Loading configuration from config.env..."
     source ../config/config.env
 else
     print_warning "config.env not found. Please provide the following information:"
-    
+
     read -p "Enter Azure Subscription ID: " AZURE_SUBSCRIPTION_ID
     read -p "Enter Resource Group name: " AZURE_RESOURCE_GROUP
     read -p "Enter Azure Region (default: eastus): " AZURE_LOCATION
     AZURE_LOCATION=${AZURE_LOCATION:-eastus}
+    read -p "Enter AKS cluster name: " AKS_CLUSTER_NAME
     read -p "Enter Storage Account name prefix (default: velerobackup): " STORAGE_ACCOUNT_PREFIX
     STORAGE_ACCOUNT_PREFIX=${STORAGE_ACCOUNT_PREFIX:-velerobackup}
     read -p "Enter Blob Container name (default: velero-backups): " BLOB_CONTAINER
     BLOB_CONTAINER=${BLOB_CONTAINER:-velero-backups}
+    read -p "Enter Managed Identity name (default: velero-identity): " MANAGED_IDENTITY_NAME
+    MANAGED_IDENTITY_NAME=${MANAGED_IDENTITY_NAME:-velero-identity}
 fi
 
-# Generate unique storage account name (must be globally unique, lowercase, no special chars)
+# Generate a unique storage account name (lowercase, max 24 chars)
 TIMESTAMP=$(date +%s)
 STORAGE_ACCOUNT="${STORAGE_ACCOUNT_PREFIX}${TIMESTAMP}"
-# Ensure it's lowercase and max 24 chars
 STORAGE_ACCOUNT=$(echo "${STORAGE_ACCOUNT}" | tr '[:upper:]' '[:lower:]' | cut -c1-24)
 
 print_info "Configuration:"
-print_info "  Subscription ID: ${AZURE_SUBSCRIPTION_ID}"
-print_info "  Resource Group: ${AZURE_RESOURCE_GROUP}"
-print_info "  Location: ${AZURE_LOCATION}"
-print_info "  Storage Account: ${STORAGE_ACCOUNT}"
-print_info "  Blob Container: ${BLOB_CONTAINER}"
+print_info "  Subscription ID:   ${AZURE_SUBSCRIPTION_ID}"
+print_info "  Resource Group:    ${AZURE_RESOURCE_GROUP}"
+print_info "  Location:          ${AZURE_LOCATION}"
+print_info "  AKS Cluster:       ${AKS_CLUSTER_NAME}"
+print_info "  Storage Account:   ${STORAGE_ACCOUNT}"
+print_info "  Blob Container:    ${BLOB_CONTAINER}"
+print_info "  Managed Identity:  ${MANAGED_IDENTITY_NAME}"
 
 read -p "Continue with this configuration? (y/n) " -n 1 -r
 echo
@@ -83,11 +75,15 @@ if [[ ! $REPLY =~ ^[Yy]$ ]]; then
     exit 1
 fi
 
-# Set Azure subscription
+# ---------------------------------------------------------------------------
+# Azure subscription
+# ---------------------------------------------------------------------------
 print_info "Setting Azure subscription..."
 az account set --subscription "${AZURE_SUBSCRIPTION_ID}"
 
-# Check if resource group exists, create if not
+# ---------------------------------------------------------------------------
+# Resource group
+# ---------------------------------------------------------------------------
 print_info "Checking resource group..."
 if az group show --name "${AZURE_RESOURCE_GROUP}" &>/dev/null; then
     print_info "Resource group '${AZURE_RESOURCE_GROUP}' already exists"
@@ -98,7 +94,9 @@ else
         --location "${AZURE_LOCATION}"
 fi
 
-# Create storage account with cost optimization
+# ---------------------------------------------------------------------------
+# Storage account (no public access, HTTPS-only, TLS 1.2)
+# ---------------------------------------------------------------------------
 print_info "Creating storage account '${STORAGE_ACCOUNT}'..."
 az storage account create \
     --name "${STORAGE_ACCOUNT}" \
@@ -112,54 +110,47 @@ az storage account create \
     --min-tls-version TLS1_2 \
     --allow-blob-public-access false
 
-print_info "Storage account created successfully!"
-
-# Get storage account key
-print_info "Retrieving storage account access key..."
-AZURE_STORAGE_ACCOUNT_ACCESS_KEY=$(az storage account keys list \
+STORAGE_ACCOUNT_ID=$(az storage account show \
+    --name "${STORAGE_ACCOUNT}" \
     --resource-group "${AZURE_RESOURCE_GROUP}" \
-    --account-name "${STORAGE_ACCOUNT}" \
-    --query "[0].value" \
-    --output tsv)
+    --query id --output tsv)
 
-# Create blob container
+print_info "Storage account created: ${STORAGE_ACCOUNT_ID}"
+
+# ---------------------------------------------------------------------------
+# Blob container
+# ---------------------------------------------------------------------------
 print_info "Creating blob container '${BLOB_CONTAINER}'..."
 az storage container create \
     --name "${BLOB_CONTAINER}" \
     --account-name "${STORAGE_ACCOUNT}" \
-    --account-key "${AZURE_STORAGE_ACCOUNT_ACCESS_KEY}" \
+    --auth-mode login \
     --public-access off
 
-# Create lifecycle management policy for cost optimization
+# ---------------------------------------------------------------------------
+# Lifecycle management policy
+# ---------------------------------------------------------------------------
 print_info "Creating lifecycle management policy..."
 cat > /tmp/lifecycle-policy.json <<EOF
 {
   "rules": [
     {
       "enabled": true,
-      "name": "move-old-backups-to-cool",
+      "name": "move-old-backups",
       "type": "Lifecycle",
       "definition": {
         "actions": {
           "baseBlob": {
-            "tierToCool": {
-              "daysAfterModificationGreaterThan": 30
-            },
-            "tierToArchive": {
-              "daysAfterModificationGreaterThan": 90
-            },
-            "delete": {
-              "daysAfterModificationGreaterThan": 180
-            }
+            "tierToCool":    { "daysAfterModificationGreaterThan": 30  },
+            "tierToArchive": { "daysAfterModificationGreaterThan": 90  },
+            "delete":        { "daysAfterModificationGreaterThan": 180 }
           },
           "snapshot": {
-            "delete": {
-              "daysAfterCreationGreaterThan": 90
-            }
+            "delete": { "daysAfterCreationGreaterThan": 90 }
           }
         },
         "filters": {
-          "blobTypes": ["blockBlob"],
+          "blobTypes":   ["blockBlob"],
           "prefixMatch": ["${BLOB_CONTAINER}/"]
         }
       }
@@ -174,70 +165,170 @@ az storage account management-policy create \
     --policy @/tmp/lifecycle-policy.json
 
 rm /tmp/lifecycle-policy.json
+print_info "Lifecycle policy created!"
 
-print_info "Lifecycle policy created successfully!"
+# ---------------------------------------------------------------------------
+# User-Assigned Managed Identity
+# ---------------------------------------------------------------------------
+print_info "Creating User-Assigned Managed Identity '${MANAGED_IDENTITY_NAME}'..."
+az identity create \
+    --name "${MANAGED_IDENTITY_NAME}" \
+    --resource-group "${AZURE_RESOURCE_GROUP}" \
+    --location "${AZURE_LOCATION}"
 
-# Create credentials file for Kubernetes secret
-print_info "Creating credentials file..."
-mkdir -p ../config
-cat > ../config/credentials-velero <<EOF
-AZURE_SUBSCRIPTION_ID=${AZURE_SUBSCRIPTION_ID}
-AZURE_RESOURCE_GROUP=${AZURE_RESOURCE_GROUP}
-AZURE_STORAGE_ACCOUNT_ACCESS_KEY=${AZURE_STORAGE_ACCOUNT_ACCESS_KEY}
-EOF
+IDENTITY_CLIENT_ID=$(az identity show \
+    --name "${MANAGED_IDENTITY_NAME}" \
+    --resource-group "${AZURE_RESOURCE_GROUP}" \
+    --query clientId --output tsv)
 
-# Create Kubernetes secret
-print_info "Creating Kubernetes secret..."
+IDENTITY_PRINCIPAL_ID=$(az identity show \
+    --name "${MANAGED_IDENTITY_NAME}" \
+    --resource-group "${AZURE_RESOURCE_GROUP}" \
+    --query principalId --output tsv)
+
+IDENTITY_RESOURCE_ID=$(az identity show \
+    --name "${MANAGED_IDENTITY_NAME}" \
+    --resource-group "${AZURE_RESOURCE_GROUP}" \
+    --query id --output tsv)
+
+print_info "Managed Identity client ID: ${IDENTITY_CLIENT_ID}"
+
+# ---------------------------------------------------------------------------
+# Role assignments (Storage Blob Data Contributor + Disk Snapshot Contributor)
+# ---------------------------------------------------------------------------
+print_info "Assigning 'Storage Blob Data Contributor' on the storage account..."
+az role assignment create \
+    --assignee-object-id "${IDENTITY_PRINCIPAL_ID}" \
+    --assignee-principal-type ServicePrincipal \
+    --role "Storage Blob Data Contributor" \
+    --scope "${STORAGE_ACCOUNT_ID}"
+
+RESOURCE_GROUP_ID=$(az group show \
+    --name "${AZURE_RESOURCE_GROUP}" \
+    --query id --output tsv)
+
+print_info "Assigning 'Disk Snapshot Contributor' on the resource group..."
+az role assignment create \
+    --assignee-object-id "${IDENTITY_PRINCIPAL_ID}" \
+    --assignee-principal-type ServicePrincipal \
+    --role "Disk Snapshot Contributor" \
+    --scope "${RESOURCE_GROUP_ID}"
+
+print_info "Assigning 'Reader' on the resource group (required for Velero volume discovery)..."
+az role assignment create \
+    --assignee-object-id "${IDENTITY_PRINCIPAL_ID}" \
+    --assignee-principal-type ServicePrincipal \
+    --role "Reader" \
+    --scope "${RESOURCE_GROUP_ID}"
+
+# ---------------------------------------------------------------------------
+# Enable OIDC issuer and Workload Identity on the AKS cluster
+# ---------------------------------------------------------------------------
+print_info "Enabling OIDC issuer on AKS cluster '${AKS_CLUSTER_NAME}'..."
+az aks update \
+    --name "${AKS_CLUSTER_NAME}" \
+    --resource-group "${AZURE_RESOURCE_GROUP}" \
+    --enable-oidc-issuer \
+    --enable-workload-identity
+
+OIDC_ISSUER=$(az aks show \
+    --name "${AKS_CLUSTER_NAME}" \
+    --resource-group "${AZURE_RESOURCE_GROUP}" \
+    --query "oidcIssuerProfile.issuerUrl" \
+    --output tsv)
+
+print_info "OIDC issuer URL: ${OIDC_ISSUER}"
+
+# ---------------------------------------------------------------------------
+# Federated credential — links the Velero k8s service account to the identity
+# ---------------------------------------------------------------------------
+print_info "Creating federated identity credential..."
+az identity federated-credential create \
+    --name "velero-federated-credential" \
+    --identity-name "${MANAGED_IDENTITY_NAME}" \
+    --resource-group "${AZURE_RESOURCE_GROUP}" \
+    --issuer "${OIDC_ISSUER}" \
+    --subject "system:serviceaccount:velero:velero" \
+    --audience "api://AzureADTokenExchange"
+
+print_info "Federated credential created!"
+
+# ---------------------------------------------------------------------------
+# Kubernetes namespace & service account (annotated for Workload Identity)
+# ---------------------------------------------------------------------------
+print_info "Creating Velero namespace and annotated service account..."
 kubectl create namespace velero --dry-run=client -o yaml | kubectl apply -f -
 
-kubectl create secret generic velero-credentials \
+kubectl create serviceaccount velero \
     --namespace velero \
-    --from-file=cloud=../config/credentials-velero \
     --dry-run=client -o yaml | kubectl apply -f -
 
-print_info "Kubernetes secret created successfully!"
+kubectl annotate serviceaccount velero \
+    --namespace velero \
+    --overwrite \
+    "azure.workload.identity/client-id=${IDENTITY_CLIENT_ID}"
 
-# Save configuration for future use
+kubectl label serviceaccount velero \
+    --namespace velero \
+    --overwrite \
+    "azure.workload.identity/use=true"
+
+# ---------------------------------------------------------------------------
+# Patch velero/values.yaml with actual values
+# ---------------------------------------------------------------------------
+print_info "Updating velero/values.yaml..."
+sed -i "s|<REPLACE_WITH_YOUR_RESOURCE_GROUP>|${AZURE_RESOURCE_GROUP}|g"   ../velero/values.yaml
+sed -i "s|<REPLACE_WITH_YOUR_STORAGE_ACCOUNT>|${STORAGE_ACCOUNT}|g"       ../velero/values.yaml
+sed -i "s|<REPLACE_WITH_YOUR_SUBSCRIPTION_ID>|${AZURE_SUBSCRIPTION_ID}|g" ../velero/values.yaml
+sed -i "s|<REPLACE_WITH_YOUR_CLIENT_ID>|${IDENTITY_CLIENT_ID}|g"           ../velero/values.yaml
+sed -i "s|velero-backups|${BLOB_CONTAINER}|g"                               ../velero/values.yaml
+print_info "values.yaml updated!"
+
+# ---------------------------------------------------------------------------
+# Save config (no secrets — workload identity needs no stored keys)
+# ---------------------------------------------------------------------------
+mkdir -p ../config
 cat > ../config/config.env <<EOF
-# Azure Configuration for Velero
+# Azure Configuration for Velero (Workload Identity — no secrets stored)
 AZURE_SUBSCRIPTION_ID=${AZURE_SUBSCRIPTION_ID}
 AZURE_RESOURCE_GROUP=${AZURE_RESOURCE_GROUP}
 AZURE_LOCATION=${AZURE_LOCATION}
+AKS_CLUSTER_NAME=${AKS_CLUSTER_NAME}
 STORAGE_ACCOUNT=${STORAGE_ACCOUNT}
 BLOB_CONTAINER=${BLOB_CONTAINER}
+MANAGED_IDENTITY_NAME=${MANAGED_IDENTITY_NAME}
+IDENTITY_CLIENT_ID=${IDENTITY_CLIENT_ID}
+IDENTITY_RESOURCE_ID=${IDENTITY_RESOURCE_ID}
+OIDC_ISSUER=${OIDC_ISSUER}
 EOF
 
-print_info "Configuration saved to config/config.env"
+print_info "Configuration saved to config/config.env (no secrets — safe to inspect, but still git-ignored)"
 
-# Update values.yaml with actual values
-print_info "Updating velero/values.yaml with your configuration..."
-sed -i "s/<REPLACE_WITH_YOUR_RESOURCE_GROUP>/${AZURE_RESOURCE_GROUP}/g" ../velero/values.yaml
-sed -i "s/<REPLACE_WITH_YOUR_STORAGE_ACCOUNT>/${STORAGE_ACCOUNT}/g" ../velero/values.yaml
-sed -i "s/<REPLACE_WITH_YOUR_SUBSCRIPTION_ID>/${AZURE_SUBSCRIPTION_ID}/g" ../velero/values.yaml
-sed -i "s/velero-backups/${BLOB_CONTAINER}/g" ../velero/values.yaml
-
-print_info "values.yaml updated successfully!"
-
-# Print summary
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
 echo ""
 print_info "========================================"
-print_info "Azure Setup Complete!"
+print_info "Azure + Workload Identity Setup Complete!"
 print_info "========================================"
 echo ""
 print_info "Resources created:"
-print_info "  ✓ Resource Group: ${AZURE_RESOURCE_GROUP}"
-print_info "  ✓ Storage Account: ${STORAGE_ACCOUNT}"
-print_info "  ✓ Blob Container: ${BLOB_CONTAINER}"
-print_info "  ✓ Lifecycle Policy: Configured"
-print_info "  ✓ Kubernetes Secret: velero-credentials"
+print_info "  ✓ Storage Account:            ${STORAGE_ACCOUNT}"
+print_info "  ✓ Blob Container:             ${BLOB_CONTAINER}"
+print_info "  ✓ Lifecycle Policy:           Configured"
+print_info "  ✓ Managed Identity:           ${MANAGED_IDENTITY_NAME} (${IDENTITY_CLIENT_ID})"
+print_info "  ✓ Role: Storage Blob Data Contributor  → storage account"
+print_info "  ✓ Role: Disk Snapshot Contributor      → resource group"
+print_info "  ✓ Role: Reader                         → resource group"
+print_info "  ✓ Federated Credential:       velero-federated-credential"
+print_info "  ✓ K8s Service Account:        velero/velero (annotated)"
 echo ""
 print_info "Next steps:"
-print_info "  1. Review the updated velero/values.yaml file"
-print_info "  2. Deploy Velero using ArgoCD:"
+print_info "  1. Review velero/values.yaml"
+print_info "  2. Deploy Velero via ArgoCD:"
 print_info "     kubectl apply -f argocd/velero-application.yaml"
 print_info "  3. Verify installation:"
-print_info "     kubectl get pods -n velero"
+print_info "     ./verify-installation.sh"
 echo ""
-print_warning "Security Note: The credentials file is stored at config/credentials-velero"
-print_warning "Make sure to add this to .gitignore and never commit it to version control!"
+print_warning "No storage keys were created or stored. Auth is handled entirely by Workload Identity."
 echo ""
