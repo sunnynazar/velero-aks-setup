@@ -1,51 +1,39 @@
 # Velero Helm Chart Values
-# This configuration is optimized for AKS with cost optimization and PVC backup support
+# Configured for AKS with Workload Identity (no storage keys), CSI snapshots, and cost optimisation
 
-# Image configuration
 image:
   repository: velero/velero
   tag: v1.13.0
   pullPolicy: IfNotPresent
 
-# Velero configuration
 configuration:
-  # Backup storage location configuration
   backupStorageLocation:
     - name: default
       provider: azure
-      bucket: velero-backups  # Azure Blob Container name
+      bucket: velero-backups          # replaced by setup-azure.sh
       prefix: backups
       config:
         resourceGroup: <REPLACE_WITH_YOUR_RESOURCE_GROUP>
         storageAccount: <REPLACE_WITH_YOUR_STORAGE_ACCOUNT>
         subscriptionId: <REPLACE_WITH_YOUR_SUBSCRIPTION_ID>
-        storageAccountKeyEnvVar: AZURE_STORAGE_ACCOUNT_ACCESS_KEY
-  
-  # Volume snapshot location for PVCs
+        # Workload Identity — no storageAccountKeyEnvVar needed
+        useAAD: "true"
+
   volumeSnapshotLocation:
     - name: default
       provider: azure
       config:
         resourceGroup: <REPLACE_WITH_YOUR_RESOURCE_GROUP>
         subscriptionId: <REPLACE_WITH_YOUR_SUBSCRIPTION_ID>
-        # Use incremental snapshots for cost optimization
-        incremental: "true"
+        incremental: "true"           # incremental snapshots = lower cost
         apiTimeout: 5m
 
-  # Backup configuration
-  defaultBackupTTL: 720h  # 30 days retention
+  defaultBackupTTL: 720h              # 30 days
   defaultVolumeSnapshotLocations: azure:default
-  
-  # Features
   features: EnableCSI
-  
-  # Upload backup logs to object storage
-  uploaderType: kopia  # More efficient than restic
-  
-  # Garbage collection settings
+  uploaderType: kopia
   garbageCollectionFrequency: 24h
 
-# Resource limits - optimized for cost
 resources:
   requests:
     cpu: 100m
@@ -54,17 +42,14 @@ resources:
     cpu: 500m
     memory: 512Mi
 
-# Init containers for plugins
 initContainers:
-  # Azure plugin for backup storage
   - name: velero-plugin-for-microsoft-azure
     image: velero/velero-plugin-for-microsoft-azure:v1.9.0
     imagePullPolicy: IfNotPresent
     volumeMounts:
       - mountPath: /target
         name: plugins
-  
-  # CSI plugin for PVC snapshots
+
   - name: velero-plugin-for-csi
     image: velero/velero-plugin-for-csi:v0.7.0
     imagePullPolicy: IfNotPresent
@@ -72,32 +57,31 @@ initContainers:
       - mountPath: /target
         name: plugins
 
-# Credentials configuration
+# Workload Identity — no secret needed; credentials come from the federated token
 credentials:
-  useSecret: true
-  existingSecret: velero-credentials
-  secretContents: {}
+  useSecret: false
 
-# Service account
 serviceAccount:
   server:
-    create: true
+    create: false                     # created & annotated by setup-azure.sh
     name: velero
-    annotations: {}
+    annotations:
+      azure.workload.identity/client-id: <REPLACE_WITH_YOUR_CLIENT_ID>
 
-# RBAC
+# Pod label required for the Azure Workload Identity webhook to inject the token
+podLabels:
+  azure.workload.identity/use: "true"
+
 rbac:
   create: true
 
-# Scheduled backups
 schedules:
-  # Daily backup at 2 AM UTC
   daily-backup:
     disabled: false
     schedule: "0 2 * * *"
     useOwnerReferencesInBackup: false
     template:
-      ttl: 720h  # 30 days retention
+      ttl: 720h
       includedNamespaces:
         - "*"
       excludedNamespaces:
@@ -105,21 +89,20 @@ schedules:
         - kube-public
         - kube-node-lease
       snapshotVolumes: true
-      defaultVolumesToFsBackup: false  # Use snapshots instead of file backup
+      defaultVolumesToFsBackup: false
       storageLocation: default
       volumeSnapshotLocations:
         - default
       metadata:
         labels:
           backup-type: daily
-  
-  # Weekly backup at 3 AM Sunday UTC
+
   weekly-backup:
     disabled: false
     schedule: "0 3 * * 0"
     useOwnerReferencesInBackup: false
     template:
-      ttl: 2160h  # 90 days retention
+      ttl: 2160h
       includedNamespaces:
         - "*"
       excludedNamespaces:
@@ -135,8 +118,7 @@ schedules:
         labels:
           backup-type: weekly
 
-# Node agent (formerly restic) - disabled to save costs
-# Only enable if you have volumes that cannot use snapshots
+# Node agent disabled — snapshots handle PVCs; enable only for volumes without snapshot support
 deployNodeAgent: false
 
 nodeAgent:
@@ -148,19 +130,16 @@ nodeAgent:
       cpu: 500m
       memory: 512Mi
 
-# Metrics and monitoring
 metrics:
   enabled: true
   scrapeInterval: 30s
   scrapeTimeout: 10s
-  
-  # Enable if using Prometheus Operator
+
   serviceMonitor:
     enabled: false
     additionalLabels:
       release: prometheus
 
-  # Prometheus rules
   prometheusRule:
     enabled: false
     additionalLabels:
@@ -183,36 +162,33 @@ metrics:
         labels:
           severity: warning
 
-# Kubectl image for backup hooks
 kubectl:
   image:
     repository: docker.io/bitnami/kubectl
     tag: 1.28
 
-# Cleanup CRDs on uninstall
-cleanUpCRDs: false
-
-# Configuration for snapshot controller
 snapshotsEnabled: true
-
-# Deploy with a single replica
-replicas: 1
-
-# Backup job cleanup
 backupsEnabled: true
+replicas: 1
+cleanUpCRDs: false
+upgradeCRDs: true
 
-# Log level (debug, info, warning, error, fatal, panic)
+upgradeCRDsJob:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
 logLevel: info
-
-# Log format (text, json)
 logFormat: text
 
-# Configure plugin tolerations and node affinity if needed
 tolerations: []
 affinity: {}
 nodeSelector: {}
 
-# Security context
 podSecurityContext:
   fsGroup: 65534
   runAsNonRoot: true
@@ -225,26 +201,7 @@ containerSecurityContext:
       - ALL
   readOnlyRootFilesystem: true
 
-# Additional volumes
 extraVolumes: []
 extraVolumeMounts: []
-
-# Extra environment variables
 extraEnvVars: {}
-
-# Extra annotations for pods
 podAnnotations: {}
-
-# Extra labels for pods
-podLabels: {}
-
-# Upgrade job for CRDs
-upgradeCRDs: true
-upgradeCRDsJob:
-  resources:
-    requests:
-      cpu: 100m
-      memory: 128Mi
-    limits:
-      cpu: 500m
-      memory: 512Mi

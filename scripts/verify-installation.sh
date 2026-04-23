@@ -2,214 +2,208 @@
 
 ###############################################################################
 # Velero Installation Verification Script
-# This script verifies that Velero is properly installed and configured
+# Verifies Velero deployment with Workload Identity on AKS
 ###############################################################################
 
-set -e
+set -euo pipefail
 
-# Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-print_info() {
-    echo -e "${GREEN}[✓]${NC} $1"
+PASS=0
+WARN=0
+FAIL=0
+
+ok()   { echo -e "${GREEN}[PASS]${NC} $1"; ((PASS++)); }
+warn() { echo -e "${YELLOW}[WARN]${NC} $1"; ((WARN++)); }
+fail() { echo -e "${RED}[FAIL]${NC} $1"; ((FAIL++)); }
+info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+
+section() {
+    echo ""
+    echo "--- $1 ---"
 }
 
-print_warning() {
-    echo -e "${YELLOW}[!]${NC} $1"
-}
+# ---------------------------------------------------------------------------
+section "Namespace & Service Account"
+# ---------------------------------------------------------------------------
 
-print_error() {
-    echo -e "${RED}[✗]${NC} $1"
-}
-
-print_header() {
-    echo -e "${BLUE}[INFO]${NC} $1"
-}
-
-echo "========================================"
-echo "Velero Installation Verification"
-echo "========================================"
-echo ""
-
-# Check if Velero namespace exists
-print_header "Checking Velero namespace..."
 if kubectl get namespace velero &>/dev/null; then
-    print_info "Namespace 'velero' exists"
+    ok "Namespace 'velero' exists"
 else
-    print_error "Namespace 'velero' not found"
-    exit 1
+    fail "Namespace 'velero' not found"
 fi
-echo ""
 
-# Check if Velero pods are running
-print_header "Checking Velero pods..."
-VELERO_PODS=$(kubectl get pods -n velero -l app.kubernetes.io/name=velero --no-headers 2>/dev/null | wc -l)
-if [ "$VELERO_PODS" -gt 0 ]; then
-    print_info "Found $VELERO_PODS Velero pod(s)"
+if kubectl get serviceaccount velero -n velero &>/dev/null; then
+    ok "ServiceAccount 'velero' exists"
+
+    CLIENT_ID=$(kubectl get serviceaccount velero -n velero \
+        -o jsonpath='{.metadata.annotations.azure\.workload\.identity/client-id}' 2>/dev/null || true)
+    if [ -n "${CLIENT_ID}" ]; then
+        ok "ServiceAccount annotated with Workload Identity client-id: ${CLIENT_ID}"
+    else
+        fail "ServiceAccount missing annotation 'azure.workload.identity/client-id' — Workload Identity will not work"
+    fi
+else
+    fail "ServiceAccount 'velero' not found in namespace velero"
+fi
+
+# ---------------------------------------------------------------------------
+section "Velero Pods"
+# ---------------------------------------------------------------------------
+
+TOTAL=$(kubectl get pods -n velero -l app.kubernetes.io/name=velero --no-headers 2>/dev/null | wc -l)
+if [ "${TOTAL}" -gt 0 ]; then
+    ok "Found ${TOTAL} Velero pod(s)"
     kubectl get pods -n velero -l app.kubernetes.io/name=velero
-    
-    # Check if pods are running
-    RUNNING_PODS=$(kubectl get pods -n velero -l app.kubernetes.io/name=velero --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l)
-    if [ "$RUNNING_PODS" -eq "$VELERO_PODS" ]; then
-        print_info "All Velero pods are running"
+    RUNNING=$(kubectl get pods -n velero -l app.kubernetes.io/name=velero \
+        --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l)
+    if [ "${RUNNING}" -eq "${TOTAL}" ]; then
+        ok "All ${RUNNING} pod(s) are Running"
     else
-        print_warning "Some Velero pods are not running"
+        fail "${RUNNING}/${TOTAL} pod(s) Running — check: kubectl logs -n velero deployment/velero"
     fi
 else
-    print_error "No Velero pods found"
-    exit 1
+    fail "No Velero pods found"
 fi
-echo ""
 
-# Check Velero secret
-print_header "Checking Velero credentials secret..."
+# Check that pods carry the Workload Identity label
+WI_LABEL=$(kubectl get pods -n velero -l "app.kubernetes.io/name=velero,azure.workload.identity/use=true" \
+    --no-headers 2>/dev/null | wc -l)
+if [ "${WI_LABEL}" -gt 0 ]; then
+    ok "Pods have label 'azure.workload.identity/use=true'"
+else
+    warn "Pods are missing label 'azure.workload.identity/use=true' — check podLabels in values.yaml"
+fi
+
+# Verify no legacy secret is being used
 if kubectl get secret velero-credentials -n velero &>/dev/null; then
-    print_info "Secret 'velero-credentials' exists"
+    warn "Secret 'velero-credentials' still exists — expected to be unused with Workload Identity"
 else
-    print_error "Secret 'velero-credentials' not found"
-    exit 1
+    ok "No legacy storage-key secret present"
 fi
-echo ""
 
-# Check backup storage location
-print_header "Checking Backup Storage Location..."
-if kubectl get backupstoragelocation -n velero &>/dev/null; then
-    BSL_COUNT=$(kubectl get backupstoragelocation -n velero --no-headers 2>/dev/null | wc -l)
-    if [ "$BSL_COUNT" -gt 0 ]; then
-        print_info "Found $BSL_COUNT Backup Storage Location(s)"
-        kubectl get backupstoragelocation -n velero
-        
-        # Check if BSL is available
-        AVAILABLE_BSL=$(kubectl get backupstoragelocation -n velero -o jsonpath='{.items[?(@.status.phase=="Available")].metadata.name}' 2>/dev/null)
-        if [ -n "$AVAILABLE_BSL" ]; then
-            print_info "Backup Storage Location is Available: $AVAILABLE_BSL"
-        else
-            print_warning "Backup Storage Location is not yet Available. This may take a few minutes."
-        fi
+# ---------------------------------------------------------------------------
+section "Backup Storage Location"
+# ---------------------------------------------------------------------------
+
+BSL_COUNT=$(kubectl get backupstoragelocation -n velero --no-headers 2>/dev/null | wc -l)
+if [ "${BSL_COUNT}" -gt 0 ]; then
+    ok "Found ${BSL_COUNT} BackupStorageLocation(s)"
+    kubectl get backupstoragelocation -n velero
+    AVAIL=$(kubectl get backupstoragelocation -n velero \
+        -o jsonpath='{.items[?(@.status.phase=="Available")].metadata.name}' 2>/dev/null)
+    if [ -n "${AVAIL}" ]; then
+        ok "BackupStorageLocation Available: ${AVAIL}"
     else
-        print_error "No Backup Storage Locations found"
+        fail "BackupStorageLocation not Available — auth or network issue (check pod logs)"
     fi
 else
-    print_error "Unable to check Backup Storage Locations"
+    fail "No BackupStorageLocations found"
 fi
-echo ""
 
-# Check volume snapshot location
-print_header "Checking Volume Snapshot Location..."
-if kubectl get volumesnapshotlocation -n velero &>/dev/null; then
-    VSL_COUNT=$(kubectl get volumesnapshotlocation -n velero --no-headers 2>/dev/null | wc -l)
-    if [ "$VSL_COUNT" -gt 0 ]; then
-        print_info "Found $VSL_COUNT Volume Snapshot Location(s)"
-        kubectl get volumesnapshotlocation -n velero
+# ---------------------------------------------------------------------------
+section "Volume Snapshot Location"
+# ---------------------------------------------------------------------------
+
+VSL_COUNT=$(kubectl get volumesnapshotlocation -n velero --no-headers 2>/dev/null | wc -l)
+if [ "${VSL_COUNT}" -gt 0 ]; then
+    ok "Found ${VSL_COUNT} VolumeSnapshotLocation(s)"
+    kubectl get volumesnapshotlocation -n velero
+else
+    warn "No VolumeSnapshotLocations found — PVC snapshots will not work"
+fi
+
+# ---------------------------------------------------------------------------
+section "CSI VolumeSnapshotClass"
+# ---------------------------------------------------------------------------
+
+VSC_COUNT=$(kubectl get volumesnapshotclass --no-headers 2>/dev/null | wc -l)
+if [ "${VSC_COUNT}" -gt 0 ]; then
+    ok "Found ${VSC_COUNT} VolumeSnapshotClass(es)"
+    kubectl get volumesnapshotclass
+
+    # Check that at least one has the Velero label
+    VELERO_VSC=$(kubectl get volumesnapshotclass \
+        -l velero.io/csi-volumesnapshot-class=true --no-headers 2>/dev/null | wc -l)
+    if [ "${VELERO_VSC}" -gt 0 ]; then
+        ok "VolumeSnapshotClass labelled for Velero CSI found"
     else
-        print_warning "No Volume Snapshot Locations found"
+        warn "No VolumeSnapshotClass has label 'velero.io/csi-volumesnapshot-class=true' — label one for CSI snapshots to work"
     fi
 else
-    print_warning "Unable to check Volume Snapshot Locations"
+    warn "No VolumeSnapshotClasses found — install the AKS CSI snapshot controller"
 fi
-echo ""
 
-# Check CSI driver
-print_header "Checking CSI VolumeSnapshotClass..."
-if kubectl get volumesnapshotclass &>/dev/null; then
-    VSC_COUNT=$(kubectl get volumesnapshotclass --no-headers 2>/dev/null | wc -l)
-    if [ "$VSC_COUNT" -gt 0 ]; then
-        print_info "Found $VSC_COUNT VolumeSnapshotClass(es)"
-        kubectl get volumesnapshotclass
-    else
-        print_warning "No VolumeSnapshotClasses found. PVC snapshots may not work."
-    fi
+# ---------------------------------------------------------------------------
+section "Scheduled Backups"
+# ---------------------------------------------------------------------------
+
+SCHED_COUNT=$(kubectl get schedule -n velero --no-headers 2>/dev/null | wc -l)
+if [ "${SCHED_COUNT}" -gt 0 ]; then
+    ok "Found ${SCHED_COUNT} Schedule(s)"
+    kubectl get schedule -n velero
 else
-    print_warning "Unable to check VolumeSnapshotClasses"
+    warn "No Schedules found — check values.yaml schedules block"
 fi
-echo ""
 
-# Check scheduled backups
-print_header "Checking Scheduled Backups..."
-if kubectl get schedule -n velero &>/dev/null; then
-    SCHEDULE_COUNT=$(kubectl get schedule -n velero --no-headers 2>/dev/null | wc -l)
-    if [ "$SCHEDULE_COUNT" -gt 0 ]; then
-        print_info "Found $SCHEDULE_COUNT Scheduled Backup(s)"
-        kubectl get schedule -n velero
-    else
-        print_warning "No Scheduled Backups found"
-    fi
-else
-    print_warning "Unable to check Scheduled Backups"
-fi
-echo ""
+# ---------------------------------------------------------------------------
+section "Velero CLI"
+# ---------------------------------------------------------------------------
 
-# Check if velero CLI is installed
-print_header "Checking Velero CLI..."
 if command -v velero &>/dev/null; then
-    VELERO_VERSION=$(velero version --client-only 2>/dev/null | grep "Version:" | awk '{print $2}')
-    print_info "Velero CLI is installed (Version: $VELERO_VERSION)"
-    
-    # Run velero backup get if CLI is available
-    print_header "Checking existing backups..."
-    if velero backup get -n velero &>/dev/null; then
-        BACKUP_COUNT=$(velero backup get -n velero --no-headers 2>/dev/null | wc -l)
-        if [ "$BACKUP_COUNT" -gt 0 ]; then
-            print_info "Found $BACKUP_COUNT backup(s)"
-            velero backup get -n velero
-        else
-            print_info "No backups found yet (this is normal for a new installation)"
-        fi
+    VER=$(velero version --client-only 2>/dev/null | grep "Version:" | awk '{print $2}')
+    ok "Velero CLI installed (${VER})"
+    BACKUP_COUNT=$(velero backup get -n velero --no-headers 2>/dev/null | wc -l)
+    if [ "${BACKUP_COUNT}" -gt 0 ]; then
+        ok "Found ${BACKUP_COUNT} backup(s)"
+        velero backup get -n velero
+    else
+        info "No backups yet (normal for a new installation)"
     fi
 else
-    print_warning "Velero CLI is not installed. Install it for easier management:"
-    echo "    https://velero.io/docs/main/basic-install/#install-the-cli"
+    warn "Velero CLI not installed — install from https://velero.io/docs/main/basic-install/#install-the-cli"
 fi
-echo ""
 
-# Check ArgoCD Application (if ArgoCD is installed)
-print_header "Checking ArgoCD Application..."
+# ---------------------------------------------------------------------------
+section "ArgoCD Application"
+# ---------------------------------------------------------------------------
+
 if kubectl get application velero -n argocd &>/dev/null 2>&1; then
-    print_info "ArgoCD Application 'velero' exists"
-    SYNC_STATUS=$(kubectl get application velero -n argocd -o jsonpath='{.status.sync.status}' 2>/dev/null)
-    HEALTH_STATUS=$(kubectl get application velero -n argocd -o jsonpath='{.status.health.status}' 2>/dev/null)
-    
-    if [ "$SYNC_STATUS" = "Synced" ]; then
-        print_info "Sync Status: Synced"
-    else
-        print_warning "Sync Status: $SYNC_STATUS"
-    fi
-    
-    if [ "$HEALTH_STATUS" = "Healthy" ]; then
-        print_info "Health Status: Healthy"
-    else
-        print_warning "Health Status: $HEALTH_STATUS"
-    fi
+    ok "ArgoCD Application 'velero' exists"
+    SYNC=$(kubectl get application velero -n argocd -o jsonpath='{.status.sync.status}' 2>/dev/null)
+    HEALTH=$(kubectl get application velero -n argocd -o jsonpath='{.status.health.status}' 2>/dev/null)
+    [ "${SYNC}" = "Synced" ]   && ok "Sync: ${SYNC}"   || warn "Sync: ${SYNC}"
+    [ "${HEALTH}" = "Healthy" ] && ok "Health: ${HEALTH}" || warn "Health: ${HEALTH}"
 else
-    print_warning "ArgoCD Application not found (or ArgoCD not installed)"
+    warn "ArgoCD Application 'velero' not found (skip if not using ArgoCD)"
 fi
-echo ""
 
-# Final summary
+# ---------------------------------------------------------------------------
+section "Workload Identity Webhook"
+# ---------------------------------------------------------------------------
+
+WEBHOOK=$(kubectl get mutatingwebhookconfiguration \
+    azure-wi-webhook-mutating-webhook-configuration --no-headers 2>/dev/null | wc -l)
+if [ "${WEBHOOK}" -gt 0 ]; then
+    ok "Azure Workload Identity webhook is installed"
+else
+    fail "Azure Workload Identity webhook not found — install azure-workload-identity chart or use 'az aks addon enable'"
+fi
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "========================================"
 echo "Verification Summary"
+printf "  PASS: %d   WARN: %d   FAIL: %d\n" "${PASS}" "${WARN}" "${FAIL}"
 echo "========================================"
-echo ""
-print_info "Velero is installed and running"
-echo ""
-print_header "Next steps:"
-echo "  1. Create a test backup:"
-echo "     kubectl create namespace test-velero"
-echo "     kubectl create deployment nginx --image=nginx -n test-velero"
-echo "     velero backup create test-backup --include-namespaces=test-velero -n velero"
-echo ""
-echo "  2. Monitor the backup:"
-echo "     velero backup describe test-backup -n velero"
-echo "     velero backup logs test-backup -n velero"
-echo ""
-echo "  3. Test restore:"
-echo "     kubectl delete namespace test-velero"
-echo "     velero restore create --from-backup test-backup -n velero"
-echo ""
-echo "  4. Monitor scheduled backups:"
-echo "     kubectl get backups -n velero -w"
+
+if [ "${FAIL}" -gt 0 ]; then
+    echo ""
+    echo "One or more checks failed. Run 'kubectl logs -n velero deployment/velero' to investigate."
+    exit 1
+fi
 echo ""
