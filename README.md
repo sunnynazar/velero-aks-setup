@@ -1,44 +1,76 @@
-# Velero on AKS with ArgoCD - Complete Setup
+# Velero on AKS with ArgoCD
 
-This repository contains all the necessary configurations to deploy Velero on Azure Kubernetes Service (AKS) using ArgoCD with cost optimization and complete PVC backup support.
+Production-ready Velero setup for Azure Kubernetes Service using **Workload Identity** (no storage keys), ArgoCD GitOps, CSI snapshots, and cost-optimised Azure storage.
 
-## 📋 Table of Contents
+[![CI](https://github.com/sunnynazar/velero-aks-setup/actions/workflows/ci.yml/badge.svg)](https://github.com/sunnynazar/velero-aks-setup/actions/workflows/ci.yml)
 
-- [Overview](#overview)
-- [Prerequisites](#prerequisites)
-- [Architecture](#architecture)
-- [Quick Start](#quick-start)
-- [Detailed Setup](#detailed-setup)
-- [Cost Optimization](#cost-optimization)
-- [Backup and Restore](#backup-and-restore)
-- [Monitoring](#monitoring)
-- [Troubleshooting](#troubleshooting)
+## Overview
 
-## 🎯 Overview
+- Workload Identity auth — no storage account keys created or stored
+- GitOps deployment via ArgoCD
+- CSI-based PVC snapshots using Azure Managed Disks (incremental)
+- Storage lifecycle policies: Hot → Cool → Archive → Delete
+- Daily + weekly backup schedules with configurable TTL
+- Python scripts with 77 unit tests (no real cluster needed to run them)
+- GitHub Actions CI on every push and PR
 
-This setup provides:
-- ✅ Velero backup solution for AKS clusters
-- ✅ GitOps deployment via ArgoCD
-- ✅ Automated PVC snapshots using Azure Managed Disks
-- ✅ Cost-optimized storage with lifecycle policies
-- ✅ Scheduled daily and weekly backups
-- ✅ CSI driver integration for modern PVC backups
+## Repository Structure
 
-## 📦 Prerequisites
+```
+velero-aks-setup/
+├── argocd/
+│   ├── velero-application.yaml       # Deploy from upstream Helm chart
+│   └── velero-application-git.yaml  # Deploy from this Git repo
+├── velero/
+│   ├── Chart.yaml
+│   └── values.yaml                  # Helm values (placeholders filled by setup_azure.py)
+├── scripts/
+│   ├── setup_azure.py               # Provision Azure infra + Workload Identity
+│   ├── verify_installation.py       # Health checks incl. Workload Identity
+│   └── test_backup_restore.py       # E2E backup/restore tests
+├── tests/                           # Unit tests (77 tests, all mocked)
+├── config/
+│   └── config.example.env           # Template — copy to config.env, never commit
+├── docs/
+│   ├── INSTALLATION.md
+│   ├── BACKUP_STRATEGIES.md
+│   └── TROUBLESHOOTING.md
+├── requirements.txt                 # Runtime Python dependencies
+├── requirements-dev.txt             # Dev dependencies (pytest, ruff)
+├── pyproject.toml                   # Ruff + pytest config
+└── Makefile                         # make install / test / lint / setup / verify / e2e
+```
 
-Before you begin, ensure you have:
+## Prerequisites
 
-- [x] An AKS cluster up and running
-- [x] `kubectl` configured to access your cluster
-- [x] `az` CLI installed and authenticated
-- [x] ArgoCD installed in your cluster
-- [x] Helm 3.x installed
-- [x] Proper Azure RBAC permissions:
-  - Storage Account creation
-  - Managed Disk snapshots
-  - Resource Group access
+- Python 3.11+
+- `az` CLI authenticated to the correct subscription
+- `kubectl` configured against the target AKS cluster
+- `helm` 3.x
+- ArgoCD installed in the cluster
+- Azure RBAC: ability to create identities, assign roles, and manage storage
 
-## 🏗️ Architecture
+## Quick Start
+
+```bash
+# 1. Install Python dependencies
+pip install -r requirements.txt
+
+# 2. Configure
+cp config/config.example.env config/config.env
+# Fill in: AZURE_SUBSCRIPTION_ID, AZURE_RESOURCE_GROUP, AZURE_LOCATION, AKS_CLUSTER_NAME
+
+# 3. Provision Azure resources + Workload Identity (idempotent, safe to re-run)
+python scripts/setup_azure.py
+
+# 4. Deploy via ArgoCD
+kubectl apply -f argocd/velero-application.yaml
+
+# 5. Verify
+python scripts/verify_installation.py
+```
+
+## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -46,350 +78,196 @@ Before you begin, ensure you have:
 │                                                      │
 │  ┌──────────────┐         ┌──────────────┐         │
 │  │   ArgoCD     │────────▶│    Velero    │         │
-│  │              │         │   Namespace  │         │
+│  │              │         │  (velero SA) │         │
 │  └──────────────┘         └──────┬───────┘         │
-│                                   │                  │
-│                          ┌────────▼────────┐        │
-│                          │  PVC Snapshots  │        │
-│                          │  (CSI Driver)   │        │
+│                                   │  Workload        │
+│                          ┌────────▼────────┐  Identity Token
+│                          │  CSI Snapshots  │        │
 │                          └────────┬────────┘        │
 └───────────────────────────────────┼──────────────────┘
                                     │
+              ┌─────────────────────▼──────────────────────┐
+              │          Azure AD Workload Identity         │
+              │  User-Assigned MI → Federated Credential    │
+              │  Roles: Storage Blob Data Contributor       │
+              │         Disk Snapshot Contributor + Reader  │
+              └─────────────────────┬──────────────────────┘
+                                    │
                     ┌───────────────▼────────────────┐
                     │     Azure Storage Account      │
+                    │  (Standard_LRS, HTTPS-only)    │
                     │  ┌──────────────────────────┐  │
                     │  │  Velero Blob Container   │  │
-                    │  │  - Backup metadata       │  │
-                    │  │  - Lifecycle policies    │  │
+                    │  │  Lifecycle: 30→90→180d   │  │
                     │  └──────────────────────────┘  │
                     │  ┌──────────────────────────┐  │
                     │  │  Managed Disk Snapshots  │  │
-                    │  │  - Incremental snapshots │  │
+                    │  │  Incremental only        │  │
                     │  └──────────────────────────┘  │
                     └─────────────────────────────────┘
 ```
 
-## 🚀 Quick Start
+## Authentication: Workload Identity
 
-1. **Clone this repository:**
-   ```bash
-   git clone https://github.com/YOUR-USERNAME/velero-aks-setup.git
-   cd velero-aks-setup
-   ```
+`setup_azure.py` provisions this end-to-end with no manual steps:
 
-2. **Run the setup script:**
-   ```bash
-   chmod +x scripts/setup-azure.sh
-   ./scripts/setup-azure.sh
-   ```
+1. Creates a **User-Assigned Managed Identity** (`velero-identity`)
+2. Assigns minimum required roles:
+   - `Storage Blob Data Contributor` on the storage account
+   - `Disk Snapshot Contributor` + `Reader` on the resource group
+3. Enables **OIDC issuer** and **Workload Identity** on the AKS cluster
+4. Creates a **federated credential** linking the identity to `velero/velero` SA
+5. Annotates the Kubernetes ServiceAccount with the client ID
 
-3. **Update configuration:**
-   ```bash
-   # Edit with your values
-   cp config/config.example.env config/config.env
-   vim config/config.env
-   ```
+The Azure Workload Identity webhook injects a short-lived AAD token into the Velero pod at runtime. No storage keys are ever created or stored.
 
-4. **Deploy with ArgoCD:**
-   ```bash
-   kubectl apply -f argocd/velero-application.yaml
-   ```
-
-## 📖 Detailed Setup
-
-### Step 1: Azure Infrastructure Setup
-
-Run the Azure setup script to create necessary resources:
+## Developer Workflow
 
 ```bash
-cd scripts
-./setup-azure.sh
+make install       # pip install -r requirements-dev.txt
+make test          # pytest --cov (77 tests, no real cluster needed)
+make lint          # ruff check scripts/ tests/
+make setup         # python scripts/setup_azure.py
+make verify        # python scripts/verify_installation.py
+make e2e           # python scripts/test_backup_restore.py
+make e2e-skip-pvc  # python scripts/test_backup_restore.py --skip-pvc
 ```
 
-This script creates:
-- Storage Account (Standard_LRS for cost optimization)
-- Blob Container for Velero backups
-- Lifecycle management policies
-- Retrieves necessary credentials
+## E2E Test Coverage
 
-### Step 2: Configure Values
-
-Update the `velero/values.yaml` file with your Azure details:
-
-```yaml
-configuration:
-  backupStorageLocation:
-    - name: default
-      provider: azure
-      bucket: velero-backups
-      config:
-        resourceGroup: YOUR_RESOURCE_GROUP
-        storageAccount: YOUR_STORAGE_ACCOUNT
-        subscriptionId: YOUR_SUBSCRIPTION_ID
-```
-
-### Step 3: Create Kubernetes Secret
+| Test | What it verifies |
+|------|-----------------|
+| Pre-flight | Velero pod running, WI annotation, webhook present, BSL Available |
+| Namespace backup & restore | Deployment, ConfigMap, Secret backed up and restored; data integrity checked |
+| Cross-namespace restore | Restore into a different namespace via `--namespace-mappings` |
+| PVC backup & restore | CSI snapshot of a 1Gi PVC; data written pre-backup verified post-restore |
 
 ```bash
-# The setup script generates this, or create manually:
-kubectl create namespace velero
-
-kubectl create secret generic velero-credentials \
-  --namespace velero \
-  --from-literal=cloud="$(cat config/credentials-velero)"
+python scripts/test_backup_restore.py              # Full suite
+python scripts/test_backup_restore.py --skip-pvc  # Skip CSI snapshot test
+python scripts/test_backup_restore.py --keep-resources  # Preserve test resources
 ```
 
-### Step 4: Deploy via ArgoCD
+## Backup and Restore
 
 ```bash
-# Apply the ArgoCD application
-kubectl apply -f argocd/velero-application.yaml
+# Manual backup
+velero backup create my-backup --include-namespaces=production
 
-# Watch the deployment
-kubectl get application velero -n argocd -w
-```
-
-### Step 5: Verify Installation
-
-```bash
-# Check Velero pods
-kubectl get pods -n velero
-
-# Verify backup location
-kubectl get backupstoragelocation -n velero
-
-# Check volume snapshot location
-kubectl get volumesnapshotlocation -n velero
-
-# Verify CSI driver
-kubectl get volumesnapshotclass
-```
-
-## 💰 Cost Optimization
-
-This setup implements several cost-saving measures:
-
-### 1. Storage Tier Optimization
-- **Standard_LRS** storage account (cheapest option)
-- **Hot tier** for recent backups
-- **Cool tier** after 30 days (60% cheaper)
-- **Archive tier** after 90 days (90% cheaper)
-- **Auto-deletion** after 180 days
-
-### 2. Incremental Snapshots
-- Only stores changed blocks
-- Reduces storage costs by 80-90% for subsequent snapshots
-
-### 3. Optimized Backup Schedule
-- Daily backups: 30-day retention
-- Weekly backups: 90-day retention
-- Customize based on your compliance needs
-
-### 4. Resource Limits
-- Minimal CPU/Memory allocation for Velero pods
-- Scales only when needed
-
-### 5. Estimated Monthly Costs (example)
-
-For a 100GB cluster:
-- Storage Account: ~$2/month
-- Snapshots (incremental): ~$5-10/month
-- Total: **~$7-12/month**
-
-## 🔄 Backup and Restore
-
-### Create Manual Backup
-
-```bash
-# Backup entire cluster
-velero backup create full-backup
-
-# Backup specific namespace
-velero backup create app-backup --include-namespaces=production
-
-# Backup with PVC snapshots
-velero backup create pvc-backup --snapshot-volumes=true
-
-# Backup specific resources
-velero backup create db-backup \
-  --include-resources=persistentvolumeclaims,persistentvolumes \
-  --selector app=postgresql
-```
-
-### Restore from Backup
-
-```bash
-# List available backups
+# List backups
 velero backup get
 
-# Restore entire backup
-velero restore create --from-backup full-backup
+# Restore
+velero restore create --from-backup my-backup
 
-# Restore specific namespace
-velero restore create --from-backup app-backup \
-  --include-namespaces=production
-
-# Restore to different namespace
-velero restore create --from-backup app-backup \
-  --namespace-mappings old-namespace:new-namespace
+# Cross-namespace restore
+velero restore create --from-backup my-backup \
+  --namespace-mappings production:production-dr
 ```
 
-### Scheduled Backups
+Scheduled backups run automatically:
+- **Daily** at 2 AM UTC — 30-day retention
+- **Weekly** Sunday at 3 AM UTC — 90-day retention
 
-Backups are automatically created based on the schedule in `values.yaml`:
-- **Daily**: 2 AM UTC (30-day retention)
-- **Weekly**: 3 AM Sunday UTC (90-day retention)
+## Cost Optimisation
 
-Customize schedules:
-```yaml
-schedules:
-  custom-backup:
-    schedule: "0 */6 * * *"  # Every 6 hours
-    template:
-      ttl: 168h  # 7 days
-```
+| Measure | Saving |
+|---------|--------|
+| `Standard_LRS` storage | Cheapest redundancy tier |
+| Hot → Cool after 30 days | ~60% cheaper |
+| Cool → Archive after 90 days | ~90% cheaper |
+| Delete after 180 days | No unbounded growth |
+| Incremental disk snapshots | 80–90% less storage for subsequent snapshots |
+| Node agent disabled | No DaemonSet cost |
 
-## 📊 Monitoring
+Estimated: **~$7–12/month** for a 100 GB cluster.
 
-### Check Backup Status
+## Monitoring
 
-```bash
-# List all backups
-velero backup get
-
-# Describe specific backup
-velero backup describe daily-backup-20240119
-
-# View backup logs
-velero backup logs daily-backup-20240119
-
-# Check for failed backups
-velero backup get | grep -i failed
-```
-
-### Prometheus Metrics
-
-If you have Prometheus Operator installed:
+Enable Prometheus metrics in `values.yaml`:
 
 ```yaml
-# Enable in values.yaml
 metrics:
   enabled: true
   serviceMonitor:
-    enabled: true
+    enabled: true   # requires Prometheus Operator
 ```
 
-Key metrics to monitor:
+Key metrics:
 - `velero_backup_success_total`
 - `velero_backup_failure_total`
 - `velero_backup_duration_seconds`
 - `velero_volume_snapshot_success_total`
 
-### Set Up Alerts
-
-Example Prometheus alert:
+Example alert:
 
 ```yaml
 - alert: VeleroBackupFailed
-  expr: velero_backup_failure_total > 0
-  for: 5m
-  annotations:
-    summary: "Velero backup has failed"
+  expr: velero_backup_failure_total{schedule!=""} / velero_backup_attempt_total{schedule!=""} > 0.25
+  for: 15m
+  labels:
+    severity: warning
 ```
 
-## 🔧 Troubleshooting
+## Troubleshooting
 
-### Common Issues
+### BSL not Available
 
-#### 1. Backup Stuck in Progress
 ```bash
-# Check Velero logs
+# Check Velero logs for auth errors
 kubectl logs -n velero deployment/velero
 
-# Delete stuck backup
-velero backup delete BACKUP_NAME --confirm
+# Confirm Workload Identity annotation
+kubectl get sa velero -n velero -o jsonpath='{.metadata.annotations}'
+
+# Confirm webhook is installed
+kubectl get mutatingwebhookconfiguration azure-wi-webhook-mutating-webhook-configuration
 ```
 
-#### 2. PVC Snapshots Not Working
+### PVC Snapshots Not Working
+
 ```bash
-# Verify CSI driver
+# Confirm CSI snapshot controller is installed
 kubectl get volumesnapshotclass
 
-# Check snapshot CRDs
-kubectl get crd | grep snapshot
-
-# Verify Azure permissions
-az role assignment list --assignee $(az aks show -g RG -n CLUSTER --query identityProfile.kubeletidentity.clientId -o tsv)
+# Label a VolumeSnapshotClass for Velero
+kubectl label volumesnapshotclass <name> velero.io/csi-volumesnapshot-class=true
 ```
 
-#### 3. Authentication Errors
+### Backup Stuck
+
 ```bash
-# Verify secret exists
-kubectl get secret velero-credentials -n velero
-
-# Check secret content
-kubectl get secret velero-credentials -n velero -o yaml
-
-# Recreate secret
-kubectl delete secret velero-credentials -n velero
-./scripts/create-secret.sh
+kubectl logs -n velero deployment/velero
+velero backup describe <name> --details -n velero
+velero backup delete <name> --confirm -n velero
 ```
 
-#### 4. Storage Access Issues
-```bash
-# Test storage account access
-az storage container list --account-name STORAGE_ACCOUNT
-
-# Verify firewall rules
-az storage account show --name STORAGE_ACCOUNT --query networkRuleSet
-```
-
-### Debug Commands
+### Debug Logging
 
 ```bash
-# Enable debug logging
 kubectl set env deployment/velero -n velero VELERO_LOG_LEVEL=debug
-
-# Check all Velero resources
-kubectl get all -n velero
-
-# Describe backup storage location
-kubectl describe backupstoragelocation default -n velero
-
-# Check events
 kubectl get events -n velero --sort-by='.lastTimestamp'
 ```
 
-## 🔐 Security Best Practices
+## Security
 
-1. **Use Managed Identity** instead of storage keys (optional enhancement)
-2. **Enable encryption at rest** for storage account
-3. **Restrict network access** to storage account
-4. **Rotate credentials** regularly
-5. **Use Azure Key Vault** for secret management (optional)
+- No storage keys created or stored — Workload Identity only
+- Velero pods: non-root (`runAsUser: 65534`), all capabilities dropped, read-only root FS
+- Storage account: HTTPS-only, TLS 1.2 minimum, public blob access disabled
+- RBAC scoped to minimum required roles
+- `config/config.env` and `config/credentials-velero` are git-ignored
 
-## 📚 Additional Resources
+## Additional Resources
 
 - [Velero Documentation](https://velero.io/docs/)
-- [Azure Backup Documentation](https://learn.microsoft.com/en-us/azure/backup/)
+- [Azure Workload Identity](https://azure.github.io/azure-workload-identity/docs/)
 - [ArgoCD Documentation](https://argo-cd.readthedocs.io/)
 - [AKS Best Practices](https://learn.microsoft.com/en-us/azure/aks/best-practices)
 
-## 🤝 Contributing
+## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome. Please open an issue or pull request.
 
-## 📝 License
+## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## 📧 Support
-
-For issues and questions:
-- Open an issue in this repository
-- Check the [Troubleshooting](#troubleshooting) section
-- Review Velero Slack channel
-
----
-
-**Happy Backing Up! 🎉**
+MIT — see [LICENSE](LICENSE).
