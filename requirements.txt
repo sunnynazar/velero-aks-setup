@@ -1,0 +1,7 @@
+azure-identity>=1.15.0
+azure-mgmt-authorization>=4.0.0
+azure-mgmt-containerservice>=28.0.0
+azure-mgmt-msi>=7.0.0
+azure-mgmt-resource>=23.0.0
+azure-mgmt-storage>=21.0.0
+kubernetes>=28.1.0
